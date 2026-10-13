@@ -13,6 +13,10 @@ extends Node2D
 #region Constants
 
 const _constants := preload("res://addons/phantom_camera/scripts/phantom_camera/phantom_camera_constants.gd")
+const _rect_union := preload("res://addons/phantom_camera/scripts/phantom_camera/phantom_camera_rect_union_2d.gd")
+
+## Limit corrections that turn by more than this between frames count as a jump around an inner corner.
+const _LIMIT_CORNER_ANGLE: float = PI / 18 # 10 degrees
 
 #endregion
 
@@ -461,7 +465,7 @@ var _should_rotate_with_target: bool = false
 	set = set_limit_bottom,
 	get = get_limit_bottom
 
-## Allows for setting either a [TileMapLayer] or [CollisionShape2D] node to
+## Allows for setting either a [TileMapLayer], [CollisionShape2D] or [Area2D] node to
 ## automatically apply a limit size instead of manually adjusting the Left,
 ## Top, Right and Left properties.[br][br]
 ## [b]TileMapLayer[/b][br]
@@ -472,16 +476,32 @@ var _should_rotate_with_target: bool = false
 ## [b]CollisionShape2D[/b][br]
 ## The limit will update in realtime as the Shape2D changes its size.
 ## Note: For performance reasons, resizing the [Shape2D] during runtime will not change the Limits sides.
-@export_node_path("TileMapLayer", "CollisionShape2D") var limit_target: NodePath = NodePath(""):
+## [br][br]
+## [b]Area2D[/b][br]
+## The limit is the union of the [Area2D]'s direct [CollisionShape2D] children
+## that use a [RectangleShape2D], so L-shapes, steps and rings are possible.[br]
+## Note: Moving or resizing those shapes during runtime will not change the limit
+## until [method update_limit_all_sides] is called.
+@export_node_path("TileMapLayer", "CollisionShape2D", "Area2D") var limit_target: NodePath = NodePath(""):
 	set = set_limit_target,
 	get = get_limit_target
 
-## Applies an offset to the [TileMapLayer] Limit or [Shape2D] Limit.
+## Applies an offset to the [TileMapLayer], [Shape2D] or [Area2D] Limit.
 ## The values goes from [param Left], [param Top], [param Right]
 ## and [param Bottom].
 @export var limit_margin: Vector4i = Vector4i.ZERO:
 	set = set_limit_margin,
 	get = get_limit_margin
+
+## Only used when [member limit_target] is an [Area2D].[br]
+## Near an inner corner of the limit, the camera can jump from one side of the
+## corner to the other. This eases that jump out over this many seconds by
+## sliding along the limit's edges. Jumps the edges don't lead straight to,
+## such as across a hole or gap in the limit, are not eased.[br]
+## Set to [code]0[/code] to disable.
+@export_range(0, 2, 0.01, "or_greater", "suffix:s") var limit_corner_damping: float = 0.25:
+	set = set_limit_corner_damping,
+	get = get_limit_corner_damping
 #@export var limit_smoothed: bool = false: # TODO - Needs proper support
 	#set = set_limit_smoothing,
 	#get = get_limit_smoothing
@@ -557,6 +577,18 @@ var _limit_node: Node2D = null
 var _tile_size_perspective_scaler: Vector2 = Vector2.ONE
 
 var _limit_inactive_pcam: bool = false
+
+var _limit_union_rects: Array[Rect2] = []
+var _limit_union_maximal: Array[Rect2] = []
+var _limit_union_warnings: PackedStringArray = []
+var _limit_union_shown_warnings: PackedStringArray = []
+var _limit_union_unreachable_key: Array = []
+var _limit_union_unreachable: bool = false
+
+var _limit_corner_prev_correction: Vector2 = Vector2.ZERO
+## Distance left to ease along the limit's edges.
+var _limit_corner_remaining: float = 0
+var _limit_corner_position: Vector2 = Vector2.ZERO
 
 var _follow_target_position: Vector2 = Vector2.ZERO
 
@@ -704,6 +736,18 @@ func _validate_property(property: Dictionary) -> void:
 	if property.name == "limit_margin" and not _limit_node:
 		property.usage = PROPERTY_USAGE_NO_EDITOR
 
+	if property.name == "limit_corner_damping" and not _has_limit_union_target():
+		property.usage = PROPERTY_USAGE_NO_EDITOR
+
+
+func _get_configuration_warnings() -> PackedStringArray:
+	if not _has_limit_union_target(): return []
+
+	var warnings: PackedStringArray = _limit_union_warnings.duplicate()
+	if _limit_union_has_unreachable():
+		warnings.append("Parts of %s are smaller than the camera view at the current zoom, so the camera will never show them." % _limit_node.name)
+	return warnings
+
 
 func _enter_tree() -> void:
 	_phantom_camera_manager = Engine.get_singleton(_constants.PCAM_MANAGER_NODE_NAME)
@@ -796,6 +840,8 @@ func _limit_checker() -> void:
 	if not Engine.is_editor_hint(): return
 	if draw_limits:
 		update_limit_all_sides()
+		if _has_limit_union_target():
+			queue_redraw()
 
 
 func _follow(delta: float) -> void:
@@ -1038,7 +1084,10 @@ func _interpolate_position(target_position: Vector2, delta: float) -> void:
 				)
 
 	if _limit_inactive_pcam and not _tween_skip:
+		var unconfined_position: Vector2 = target_position
 		target_position = _set_limit_clamp_position(target_position)
+		if not _limit_union_maximal.is_empty() and not Engine.is_editor_hint():
+			target_position = _apply_limit_corner_damping(unconfined_position, target_position, delta)
 
 	_transform_output = Transform2D(output_rotation, target_position)
 
@@ -1068,6 +1117,9 @@ func _smooth_damp(target_axis: float, self_axis: float, index: int, current_velo
 
 
 func _set_limit_clamp_position(value: Vector2) -> Vector2:
+	if not _limit_union_maximal.is_empty():
+		return _rect_union.confine(value, _limit_union_maximal, _camera_frame_rect().size / 2, Vector4(limit_margin))
+
 	var camera_frame_rect_size: Vector2 = _camera_frame_rect().size
 	value.x = clampf(value.x, _limit_sides.x + camera_frame_rect_size.x / 2, _limit_sides.z - camera_frame_rect_size.x / 2)
 	value.y = clampf(value.y, _limit_sides.y + camera_frame_rect_size.y / 2, _limit_sides.w - camera_frame_rect_size.y / 2)
@@ -1079,6 +1131,123 @@ func _draw() -> void:
 
 	if frame_preview and not _is_active:
 		draw_rect(_camera_frame_rect(), Color("3ab99a"), false, 2)
+
+	if draw_limits and _has_limit_union_target():
+		_draw_limit_union()
+
+
+func _draw_limit_union() -> void:
+	draw_set_transform_matrix(get_global_transform().affine_inverse())
+	for rect in _limit_union_rects:
+		draw_rect(rect, _constants.COLOR_2D, false, 2)
+	for region in _rect_union.reachable(_limit_union_maximal, _camera_frame_rect().size / 2, Vector4(limit_margin)):
+		if region.size.x == 0 or region.size.y == 0:
+			draw_line(region.position, region.end, _constants.COLOR_PCAM, 2)
+		else:
+			draw_rect(region, _constants.COLOR_PCAM_33)
+	draw_set_transform_matrix(Transform2D.IDENTITY)
+
+
+## Eases the jump when the nearest part of an [Area2D] limit switches sides
+## around an inner corner, moving along the limit's edges so the view stays inside.
+func _apply_limit_corner_damping(unconfined: Vector2, confined: Vector2, delta: float) -> Vector2:
+	if limit_corner_damping <= 0:
+		_reset_limit_corner_damping()
+		return confined
+
+	var correction: Vector2 = confined - unconfined
+	var jumped: bool = correction.length_squared() > 0.01 and _limit_corner_prev_correction.length_squared() > 0.01 and \
+		absf(_limit_corner_prev_correction.angle_to(correction)) > _LIMIT_CORNER_ANGLE
+	_limit_corner_prev_correction = correction
+	if not jumped and _limit_corner_remaining == 0:
+		_limit_corner_position = confined
+		return confined
+
+	var path: PackedVector2Array = _rect_union.slide_path(
+		_limit_corner_position,
+		confined,
+		_limit_union_maximal,
+		_camera_frame_rect().size / 2,
+		Vector4(limit_margin)
+	)
+	var length: float = _rect_union.path_length(path)
+	if jumped:
+		_limit_corner_remaining = length
+	# Falls to 1% after limit_corner_damping seconds.
+	_limit_corner_remaining = minf(_limit_corner_remaining, length) * exp(-4.605 * delta / limit_corner_damping)
+
+	# Jump when nearly there, or when no path along the edges gets there.
+	if _limit_corner_remaining < 0.1 or path.is_empty() or \
+	path[path.size() - 1].distance_to(confined) > _rect_union.EPSILON:
+		_limit_corner_remaining = 0
+		_limit_corner_position = confined
+		return confined
+
+	_limit_corner_position = _rect_union.path_point(path, length - _limit_corner_remaining)
+	return _limit_corner_position
+
+
+func _reset_limit_corner_damping() -> void:
+	_limit_corner_prev_correction = Vector2.ZERO
+	_limit_corner_remaining = 0
+
+
+func _has_limit_union_target() -> bool:
+	return is_instance_valid(_limit_node) and _limit_node is Area2D
+
+
+func _update_limit_union(area: Area2D) -> void:
+	var rects: Array[Rect2] = []
+	var warnings: PackedStringArray = []
+	for child in area.get_children():
+		if child is CollisionPolygon2D:
+			warnings.append("%s is ignored: only RectangleShape2D shapes are used for an Area2D limit." % child.name)
+			continue
+		if not child is CollisionShape2D: continue
+
+		var shape_node: CollisionShape2D = child
+		if shape_node.disabled or shape_node.shape == null: continue
+		if not shape_node.shape is RectangleShape2D:
+			warnings.append("%s is ignored: only RectangleShape2D shapes are used for an Area2D limit." % shape_node.name)
+			continue
+		if not _rect_union.is_axis_aligned(shape_node.global_transform):
+			warnings.append("%s is rotated or skewed, so its bounding box is used for the limit." % shape_node.name)
+		rects.append(shape_node.global_transform * shape_node.shape.get_rect())
+
+	if rects.is_empty():
+		warnings.append("%s has no enabled CollisionShape2D children with a RectangleShape2D, so there is no limit." % area.name)
+	_limit_union_warnings = warnings
+
+	if rects != _limit_union_rects:
+		_limit_union_rects = rects
+		_limit_union_maximal = _rect_union.bake(rects)
+		_reset_limit_corner_damping()
+
+
+func _clear_limit_union() -> void:
+	_limit_union_rects.clear()
+	_limit_union_maximal.clear()
+	_limit_union_warnings.clear()
+
+
+## Cached, as the editor asks every frame while [member draw_limits] is on.
+func _limit_union_has_unreachable() -> bool:
+	if not is_instance_valid(_phantom_camera_manager): return false
+
+	var half_view: Vector2 = _camera_frame_rect().size / 2
+	var key: Array = [half_view, limit_margin, _limit_union_maximal]
+	if key != _limit_union_unreachable_key:
+		_limit_union_unreachable_key = key
+		_limit_union_unreachable = _rect_union.has_unreachable(_limit_union_maximal, half_view, Vector4(limit_margin))
+	return _limit_union_unreachable
+
+
+func _refresh_limit_union_warnings() -> void:
+	if not Engine.is_editor_hint(): return
+	var warnings: PackedStringArray = _get_configuration_warnings()
+	if warnings != _limit_union_shown_warnings:
+		_limit_union_shown_warnings = warnings
+		update_configuration_warnings()
 
 
 func _camera_frame_rect() -> Rect2:
@@ -1225,6 +1394,9 @@ func _is_parents_physics(target: Node = self) -> void:
 func update_limit_all_sides() -> void:
 	var limit_rect: Rect2
 
+	if not _has_limit_union_target():
+		_clear_limit_union()
+
 	if not is_instance_valid(_limit_node):
 		_limit_sides.x = limit_left
 		_limit_sides.y = limit_top
@@ -1278,8 +1450,23 @@ func update_limit_all_sides() -> void:
 		_limit_sides.z = roundi(limit_rect.position.x + limit_rect.size.x)
 		# Bottom
 		_limit_sides.w = roundi(limit_rect.position.y + limit_rect.size.y)
+	elif _limit_node is Area2D:
+		_update_limit_union(_limit_node as Area2D)
+
+		if _limit_union_maximal.is_empty():
+			_limit_sides = _limit_sides_default
+		else:
+			## Rounded outwards so the Camera2D's own limit never clamps inside the union
+			limit_rect = _limit_union_maximal[0]
+			for rect in _limit_union_maximal:
+				limit_rect = limit_rect.merge(rect)
+			_limit_sides.x = floori(limit_rect.position.x + limit_margin.x)
+			_limit_sides.y = floori(limit_rect.position.y + limit_margin.y)
+			_limit_sides.z = ceili(limit_rect.end.x - limit_margin.z)
+			_limit_sides.w = ceili(limit_rect.end.y - limit_margin.w)
 
 	_check_limit_is_not_default()
+	_refresh_limit_union_warnings()
 	if not _is_active: return
 	if not is_instance_valid(_phantom_camera_manager): return
 	_phantom_camera_manager.limit_2d_changed.emit(SIDE_LEFT, _limit_sides.x)
@@ -1331,6 +1518,7 @@ func emit_noise(value: Transform2D) -> void:
 func teleport_position() -> void:
 	_follow_velocity_ref = Vector2.ZERO
 	_reset_lookahead()
+	_reset_limit_corner_damping()
 	_set_follow_position(0.0)
 	_transform_output.origin = _follow_target_position
 	_phantom_camera_manager.pcam_teleport.emit(self)
@@ -1351,6 +1539,7 @@ func is_following() -> bool:
 func set_zoom(value: Vector2) -> void:
 	zoom = value
 	queue_redraw()
+	_refresh_limit_union_warnings()
 
 ## Gets current [member zoom] value.
 func get_zoom() -> Vector2:
@@ -1429,6 +1618,7 @@ func get_tween_ease() -> int:
 func set_is_active(node, value) -> void:
 	if node is PhantomCameraHost:
 		_is_active = value
+		if value: _reset_limit_corner_damping()
 		queue_redraw()
 	else:
 		printerr("PCams can only be set from the PhantomCameraHost")
@@ -1879,8 +2069,10 @@ func set_limit_target(value: NodePath) -> void:
 				reset_limit()
 				limit_target = NodePath("")
 				return
+		elif new_limit_node is Area2D:
+			pass # Its rectangles are read in update_limit_all_sides()
 		else:
-			printerr("Limit Target is not a TileMapLayer or CollisionShape2D node")
+			printerr("Limit Target is not a TileMapLayer, CollisionShape2D or Area2D node")
 			return
 	elif value == NodePath(""):
 		reset_limit()
@@ -1909,6 +2101,14 @@ func set_limit_margin(value: Vector4i) -> void:
 ## Get Tile Map Limit Margin.
 func get_limit_margin() -> Vector4i:
 	return limit_margin
+
+
+## Sets [member limit_corner_damping].
+func set_limit_corner_damping(value: float) -> void:
+	limit_corner_damping = maxf(0, value)
+## Gets [member limit_corner_damping].
+func get_limit_corner_damping() -> float:
+	return limit_corner_damping
 
 
 ### Enables or disables the Limit Smoothing beaviour.
